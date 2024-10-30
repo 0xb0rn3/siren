@@ -1,0 +1,9 @@
+flask==2.0.1
+colorama==0.4.4
+paramiko==2.8.1
+psutil==5.8.0
+scapy==2.4.5
+pycrypto==2.6.1
+python-nmap==0.7.1
+requests==2.26.0
+SQLAlchemy==1.4.23
