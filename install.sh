@@ -8,10 +8,6 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-WHITE='\033[1;37m'
-BOLD='\033[1m'
 NC='\033[0m'
 
 # Configuration
@@ -44,7 +40,6 @@ log() {
     local log_file="$LOG_PATH/siren_install.log"
     local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
     
-    # Create log directory if it doesn't exist
     mkdir -p "$LOG_PATH"
     
     case $level in
@@ -60,30 +55,25 @@ log() {
 # Service management functions
 check_service() {
     local service=$1
-    if systemctl is-active --quiet $service; then
+    if systemctl is-active --quiet "$service"; then
         log "INFO" "$service is running"
-        return 0
     else
         log "WARN" "$service is not running. Attempting to start..."
-        systemctl start $service
-        if systemctl is-active --quiet $service; then
+        systemctl start "$service"
+        if systemctl is-active --quiet "$service"; then
             log "INFO" "Successfully started $service"
-            return 0
         else
             log "ERROR" "Failed to start $service"
-            return 1
         fi
     fi
 }
 
 enable_service() {
     local service=$1
-    if systemctl enable --quiet $service; then
+    if systemctl enable --quiet "$service"; then
         log "INFO" "Enabled $service on startup"
-        return 0
     else
         log "ERROR" "Failed to enable $service"
-        return 1
     fi
 }
 
@@ -93,10 +83,8 @@ verify_port() {
     local service=$2
     if netstat -tuln | grep -q ":$port "; then
         log "INFO" "Port $port ($service) is listening"
-        return 0
     else
         log "ERROR" "Port $port ($service) is not listening"
-        return 1
     fi
 }
 
@@ -106,21 +94,15 @@ check_system_requirements() {
     
     # Check CPU
     local cpu_cores=$(nproc)
-    if [ $cpu_cores -lt 2 ]; then
-        log "WARN" "Less than 2 CPU cores available ($cpu_cores cores)"
-    fi
+    [ "$cpu_cores" -lt 2 ] && log "WARN" "Less than 2 CPU cores available ($cpu_cores cores)"
     
     # Check RAM
     local total_ram=$(free -m | awk '/^Mem:/{print $2}')
-    if [ $total_ram -lt 2048 ]; then
-        log "WARN" "Less than 2GB RAM available ($total_ram MB)"
-    fi
+    [ "$total_ram" -lt 2048 ] && log "WARN" "Less than 2GB RAM available ($total_ram MB)"
     
     # Check disk space
     local free_space=$(df -m / | awk 'NR==2 {print $4}')
-    if [ $free_space -lt 10240 ]; then
-        log "WARN" "Less than 10GB free space available ($free_space MB)"
-    fi
+    [ "$free_space" -lt 10240 ] && log "WARN" "Less than 10GB free space available ($free_space MB)"
 }
 
 # Backup function
@@ -140,7 +122,7 @@ create_backup() {
     
     for dir in "${backup_dirs[@]}"; do
         if [ -d "$dir" ]; then
-            tar czf "$BACKUP_PATH/$TIMESTAMP/$(basename $dir).tar.gz" "$dir" 2>/dev/null
+            tar czf "$BACKUP_PATH/$TIMESTAMP/$(basename "$dir").tar.gz" "$dir" 2>/dev/null
         fi
     done
 }
@@ -153,7 +135,6 @@ create_monitoring_scripts() {
     cat > "$SIREN_PATH/scripts/check_services.sh" << 'EOF'
 #!/bin/bash
 
-# Service monitoring script
 SERVICES=(
     "apache2:80"
     "mysql:3306"
@@ -183,11 +164,11 @@ check_and_restart_service() {
     local service=${1%:*}
     local port=${1#*:}
     
-    if ! systemctl is-active --quiet $service; then
+    if ! systemctl is-active --quiet "$service"; then
         log "Service $service is down. Attempting restart..."
-        systemctl restart $service
+        systemctl restart "$service"
         
-        if systemctl is-active --quiet $service; then
+        if systemctl is-active --quiet "$service"; then
             notify "Service $service was restarted successfully"
         else
             notify "CRITICAL: Failed to restart $service"
@@ -347,8 +328,7 @@ main() {
     
     # Create directories
     mkdir -p "$SIREN_PATH"/{scripts,logs,data,backup}
-    mkdir -p "$LOG_PATH"
-    mkdir -p "$BACKUP_PATH"
+    mkdir -p "$LOG_PATH" "$BACKUP_PATH"
     
     # Check system requirements
     check_system_requirements
@@ -363,28 +343,10 @@ main() {
     # Install dependencies
     log "INFO" "Installing dependencies..."
     apt install -y \
-        python3 \
-        python3-pip \
-        python3-dev \
-        build-essential \
-        libssl-dev \
-        libffi-dev \
-        apache2 \
-        php \
-        php-mysql \
-        mysql-server \
-        openssh-server \
-        vsftpd \
-        gcc \
-        make \
-        git \
-        curl \
-        wget \
-        netcat \
-        nmap \
-        tcpdump \
-        bc \
-        net-tools
+        python3 python3-pip python3-dev build-essential \
+        libssl-dev libffi-dev apache2 php php-mysql \
+        mysql-server openssh-server vsftpd gcc make git \
+        curl wget netcat nmap tcpdump bc net-tools
     
     # Install Python packages
     log "INFO" "Installing Python packages..."
@@ -398,16 +360,17 @@ main() {
     
     # Enable services
     log "INFO" "Enabling services..."
-    services=("siren" "siren-monitor" "siren-network")
-    for service in "${services[@]}"; do
-        enable_service $service
-        check_service $service
+    for service in "siren" "siren-monitor" "siren-network"; do
+        enable_service "$service"
+        check_service "$service"
     done
     
     # Create cron jobs
     log "INFO" "Setting up cron jobs..."
-    echo "*/5 * * * * root $SIREN_PATH/scripts/check_services.sh" > /etc/cron.d/siren
-    echo "@reboot root $SIREN_PATH/scripts/monitor_network.sh" >> /etc/cron.d/siren
+    {
+        echo "*/5 * * * * root $SIREN_PATH/scripts/check_services.sh"
+        echo "@reboot root $SIREN_PATH/scripts/monitor_network.sh"
+    } > /etc/cron.d/siren
     
     # Final checks
     log "INFO" "Performing final checks..."
