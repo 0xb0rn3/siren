@@ -137,8 +137,6 @@ prepare_system() {
         python3 \
         wget
 }
-[Previous code remains the same up until prepare_system(), then continues with:]
-
 # C code implementations
 setup_c_vulnerabilities() {
     log_status "Setting up C-based vulnerabilities..."
