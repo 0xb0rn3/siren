@@ -54,10 +54,10 @@ git clone https://github.com/q4n0/siren.git
 cd siren
 
 # Make executable
-chmod +x siren.sh
+chmod +x install.sh
 
 # Run as root
-sudo ./siren.sh
+sudo ./install.sh
 ```
 
 ## 💻 Requirements
