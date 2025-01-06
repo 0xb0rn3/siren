@@ -10,288 +10,419 @@ import pwd
 import grp
 import threading
 import logging
+import logging.config
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
 from pathlib import Path
 import secrets
 import tempfile
 from contextlib import contextmanager
 import signal
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Tuple
 from functools import wraps
 from dataclasses import dataclass
 import time
 import queue
 import re
 import ipaddress
+import traceback
 
 from colorama import init, Fore, Style
-from flask import Flask, request, render_template_string, send_file, jsonify
+from flask import Flask, request, render_template_string, send_file, jsonify, Response
 import paramiko
 import psutil
 import scapy.all as scapy
 from Crypto.Cipher import AES
 from Crypto.Random import get_random_bytes
 import nmap
+from prometheus_client import Counter, Gauge, start_http_server
+
+# Initialize colorama for cross-platform colored output
+init()
 
 @dataclass
 class VulnerabilityConfig:
-    """Configuration for vulnerability types"""
+    """Configuration for vulnerability types with enhanced tracking"""
     name: str
     enabled: bool
-    risk_level: str
+    risk_level: str  # 'low', 'medium', 'high', 'critical'
     description: str
     mitigation: str
+    detection_patterns: List[str]  # Regex patterns to detect exploitation attempts
+    max_attempts: int  # Maximum allowed attempts before alerting
+    cooldown_period: int  # Seconds to wait after max_attempts reached
+    last_triggered: datetime = None
+    attempt_count: int = 0
+
+class SecurityEvent:
+    """Represents a security-relevant event in the system"""
+    def __init__(self, event_type: str, severity: str, details: dict):
+        self.timestamp = datetime.now()
+        self.event_type = event_type
+        self.severity = severity
+        self.details = details
+        self.event_id = secrets.token_hex(8)
+
+    def to_dict(self) -> dict:
+        """Convert event to dictionary format for logging/storage"""
+        return {
+            'event_id': self.event_id,
+            'timestamp': self.timestamp.isoformat(),
+            'type': self.event_type,
+            'severity': self.severity,
+            'details': self.details
+        }
 
 class SecurityMonitor:
-    """Handles security monitoring and alerts"""
+    """Enhanced security monitoring and alerting system"""
     def __init__(self, logger):
         self.logger = logger
         self.alert_queue = queue.Queue()
         self.baseline_stats = {}
         self.anomaly_threshold = 2.0
+        self.events = queue.Queue(maxsize=1000)
+        self.metrics = self._setup_metrics()
         
-    def check_anomaly(self, metric: str, value: float) -> bool:
-        """Check if a metric shows anomalous behavior"""
-        if metric not in self.baseline_stats:
-            self.baseline_stats[metric] = {'mean': value, 'count': 1}
-            return False
+    def _setup_metrics(self) -> Dict:
+        """Initialize Prometheus metrics for monitoring"""
+        return {
+            'security_events': Counter(
+                'siren_security_events_total',
+                'Total security events by type',
+                ['event_type', 'severity']
+            ),
+            'system_load': Gauge(
+                'siren_system_load',
+                'Current system load average'
+            ),
+            'memory_usage': Gauge(
+                'siren_memory_usage_bytes',
+                'Current memory usage in bytes'
+            ),
+            'active_connections': Gauge(
+                'siren_active_connections',
+                'Number of active network connections'
+            )
+        }
+        
+    def record_event(self, event: SecurityEvent):
+        """Record and analyze security events"""
+        # Update metrics
+        self.metrics['security_events'].labels(
+            event_type=event.event_type,
+            severity=event.severity
+        ).inc()
+        
+        # Store event
+        try:
+            self.events.put_nowait(event)
+        except queue.Full:
+            # Remove oldest event if queue is full
+            self.events.get_nowait()
+            self.events.put_nowait(event)
             
-        stats = self.baseline_stats[metric]
-        deviation = abs(value - stats['mean'])
-        is_anomaly = deviation > (stats['mean'] * self.anomaly_threshold)
+        # Log event
+        self.logger.warning(f"Security Event: {event.to_dict()}")
         
-        # Update running statistics
-        stats['mean'] = ((stats['mean'] * stats['count']) + value) / (stats['count'] + 1)
-        stats['count'] += 1
+        # Check for anomalies
+        if self.check_anomaly(event.event_type, 1.0):
+            self.trigger_alert(event)
+
+    def trigger_alert(self, event: SecurityEvent):
+        """Handle security alerts"""
+        alert = {
+            'timestamp': datetime.now().isoformat(),
+            'event': event.to_dict(),
+            'recommendations': self._get_recommendations(event)
+        }
         
-        return is_anomaly
+        self.alert_queue.put(alert)
+        self.logger.error(f"Security Alert Triggered: {alert}")
+
+    def _get_recommendations(self, event: SecurityEvent) -> List[str]:
+        """Generate security recommendations based on event type"""
+        recommendations = {
+            'unauthorized_access': [
+                'Review access logs for suspicious patterns',
+                'Verify authentication mechanisms',
+                'Check for compromised credentials'
+            ],
+            'file_modification': [
+                'Compare file checksums with known good values',
+                'Review file permissions',
+                'Check for unauthorized processes'
+            ],
+            'network_anomaly': [
+                'Analyze network traffic patterns',
+                'Review firewall rules',
+                'Check for unauthorized services'
+            ]
+        }
+        return recommendations.get(event.event_type, ['Investigate suspicious activity'])
 
 class SIREN:
+    """Enhanced SIREN vulnerability lab creator with improved security features"""
     def __init__(self):
-        """Initialize SIREN with enhanced security features"""
-        self.banner = """[Banner remains the same]"""
+        """Initialize SIREN with comprehensive security controls"""
+        self.start_time = datetime.now()
         self._init_security()
         self.app = self._create_flask_app()
         self._setup_logging()
         self.config = self._load_config()
         self.monitor = SecurityMonitor(self.logger)
-        self.web_root = Path("/var/www/html")
-        self.upload_dir = self.web_root / "uploads"
-        self.backup_dir = Path("/var/backup/siren")
         self._setup_paths()
         self._init_encryption()
+        self._setup_metrics_server()
+        self.vulnerability_configs = self._load_vulnerability_configs()
         
     def _init_security(self):
-        """Initialize security measures and state tracking"""
-        self.session_key = secrets.token_hex(32)
-        self.active_services = {}
-        self.connection_limits = {}
-        self.blocked_ips = set()
-        self.file_hashes = {}
-        self.last_backup = None
+        """Initialize enhanced security measures"""
+        # Generate strong cryptographic keys
+        self.session_key = secrets.token_bytes(32)
+        self.hmac_key = secrets.token_bytes(32)
         
-    def _init_encryption(self):
-        """Setup encryption for sensitive data"""
-        self.encryption_key = get_random_bytes(32)
-        self.cipher = AES.new(self.encryption_key, AES.MODE_GCM)
+        # Security state tracking
+        self.active_services: Dict[str, Dict] = {}
+        self.connection_limits: Dict[str, List[float]] = {}
+        self.blocked_ips: Dict[str, datetime] = {}
+        self.file_hashes: Dict[str, str] = {}
+        self.auth_failures: Dict[str, List[datetime]] = {}
+        self.last_backup: Optional[datetime] = None
+        self.service_states: Dict[str, bool] = {}
         
-    def _encrypt_sensitive_data(self, data: str) -> dict:
-        """Encrypt sensitive data with AES-GCM"""
-        cipher = AES.new(self.encryption_key, AES.MODE_GCM)
-        ciphertext, tag = cipher.encrypt_and_digest(data.encode())
-        return {
-            'ciphertext': ciphertext,
-            'nonce': cipher.nonce,
-            'tag': tag
+        # Load IP blacklist
+        self.ip_blacklist = self._load_ip_blacklist()
+        
+    def _setup_metrics_server(self):
+        """Initialize Prometheus metrics endpoint"""
+        # Start metrics server on a separate port
+        self.metrics_port = 9090
+        start_http_server(self.metrics_port)
+        
+        # Define additional metrics
+        self.metrics = {
+            'requests': Counter(
+                'siren_requests_total',
+                'Total HTTP requests',
+                ['endpoint', 'method', 'status']
+            ),
+            'vulnerability_triggers': Counter(
+                'siren_vulnerability_triggers_total',
+                'Vulnerability trigger attempts',
+                ['vulnerability_type', 'success']
+            ),
+            'active_sessions': Gauge(
+                'siren_active_sessions',
+                'Number of active user sessions'
+            )
         }
-        
-    def _decrypt_sensitive_data(self, encrypted_data: dict) -> str:
-        """Decrypt sensitive data"""
-        cipher = AES.new(self.encryption_key, AES.MODE_GCM, nonce=encrypted_data['nonce'])
-        plaintext = cipher.decrypt_and_verify(encrypted_data['ciphertext'], encrypted_data['tag'])
-        return plaintext.decode()
 
-    def _setup_logging(self):
-        """Enhanced logging configuration with rotation and encryption"""
-        log_config = {
-            'version': 1,
-            'handlers': {
-                'file': {
-                    'class': 'logging.handlers.RotatingFileHandler',
-                    'filename': 'siren.log',
-                    'maxBytes': 10485760,  # 10MB
-                    'backupCount': 5,
-                    'formatter': 'detailed',
-                    'encoding': 'utf-8'
-                },
-                'security': {
-                    'class': 'logging.handlers.RotatingFileHandler',
-                    'filename': 'security.log',
-                    'maxBytes': 10485760,
-                    'backupCount': 5,
-                    'formatter': 'detailed',
-                    'encoding': 'utf-8'
-                }
-            },
-            'formatters': {
-                'detailed': {
-                    'format': '%(asctime)s - [%(levelname)s] - %(name)s - %(message)s',
-                    'datefmt': '%Y-%m-%d %H:%M:%S'
-                }
-            },
-            'loggers': {
-                'siren': {
-                    'handlers': ['file', 'security'],
-                    'level': 'INFO'
-                }
-            }
+    def _load_vulnerability_configs(self) -> Dict[str, VulnerabilityConfig]:
+        """Load and validate vulnerability configurations"""
+        with open('vulnerability_configs.json') as f:
+            configs = json.load(f)
+            
+        return {
+            name: VulnerabilityConfig(
+                name=name,
+                enabled=config['enabled'],
+                risk_level=config['risk_level'],
+                description=config['description'],
+                mitigation=config['mitigation'],
+                detection_patterns=config['detection_patterns'],
+                max_attempts=config['max_attempts'],
+                cooldown_period=config['cooldown_period']
+            )
+            for name, config in configs.items()
         }
-        logging.config.dictConfig(log_config)
-        self.logger = logging.getLogger('siren')
 
     @contextmanager
-    def _secure_temp_file(self) -> Path:
-        """Create and manage secure temporary files"""
-        temp_file = None
+    def _secure_operation(self, operation_name: str) -> None:
+        """Context manager for secure operations with proper cleanup"""
+        start_time = time.time()
         try:
-            with tempfile.NamedTemporaryFile(delete=False) as tf:
-                temp_file = Path(tf.name)
-                yield temp_file
+            self.logger.debug(f"Starting {operation_name}")
+            yield
+        except Exception as e:
+            self.logger.error(f"Error in {operation_name}: {str(e)}")
+            self.monitor.record_event(SecurityEvent(
+                'operation_error',
+                'high',
+                {'operation': operation_name, 'error': str(e)}
+            ))
+            raise
         finally:
-            if temp_file and temp_file.exists():
-                temp_file.unlink()
+            duration = time.time() - start_time
+            self.logger.debug(f"Completed {operation_name} in {duration:.2f}s")
 
-    def _rate_limit(self, func):
-        """Decorator for rate limiting requests"""
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            client_ip = request.remote_addr
-            current_time = time.time()
+    def create_vulnerability(self, vuln_type: str) -> None:
+        """Create a specific vulnerability with monitoring"""
+        config = self.vulnerability_configs.get(vuln_type)
+        if not config or not config.enabled:
+            raise ValueError(f"Vulnerability type {vuln_type} not enabled or not found")
             
-            if client_ip in self.blocked_ips:
-                return jsonify({'error': 'IP is blocked'}), 403
+        with self._secure_operation(f"create_vulnerability_{vuln_type}"):
+            # Create the vulnerability based on type
+            if vuln_type == "file_upload":
+                self.create_upload_vulnerability()
+            elif vuln_type == "sql_injection":
+                self.create_sql_vulnerability()
+            elif vuln_type == "command_injection":
+                self.create_command_vulnerability()
+            
+            self.logger.info(f"Created {vuln_type} vulnerability")
+            self.monitor.record_event(SecurityEvent(
+                'vulnerability_created',
+                'medium',
+                {'type': vuln_type, 'config': config.to_dict()}
+            ))
+
+    def monitor_exploitation(self, vuln_type: str, request_data: dict) -> bool:
+        """Monitor and detect exploitation attempts"""
+        config = self.vulnerability_configs.get(vuln_type)
+        if not config:
+            return False
+            
+        # Check for exploitation patterns
+        for pattern in config.detection_patterns:
+            if any(re.search(pattern, str(value)) for value in request_data.values()):
+                config.attempt_count += 1
                 
-            if client_ip not in self.connection_limits:
-                self.connection_limits[client_ip] = []
-            
-            # Clean old requests
-            self.connection_limits[client_ip] = [
-                t for t in self.connection_limits[client_ip]
-                if current_time - t < 60
-            ]
-            
-            if len(self.connection_limits[client_ip]) >= self.config['MAX_REQUESTS_PER_MINUTE']:
-                self.blocked_ips.add(client_ip)
-                self.logger.warning(f"IP {client_ip} blocked for excessive requests")
-                return jsonify({'error': 'Rate limit exceeded'}), 429
+                # Record the attempt
+                self.monitor.record_event(SecurityEvent(
+                    'exploitation_attempt',
+                    'high',
+                    {
+                        'vulnerability': vuln_type,
+                        'pattern_matched': pattern,
+                        'request_data': request_data,
+                        'client_ip': request.remote_addr
+                    }
+                ))
                 
-            self.connection_limits[client_ip].append(current_time)
-            return func(*args, **kwargs)
-        return wrapper
+                # Check if we should block further attempts
+                if config.attempt_count >= config.max_attempts:
+                    if not config.last_triggered or \
+                       (datetime.now() - config.last_triggered).seconds > config.cooldown_period:
+                        config.last_triggered = datetime.now()
+                        config.attempt_count = 0
+                        return True
+                        
+        return False
 
-    def create_upload_vulnerability(self):
-        """Create file upload vulnerability with enhanced monitoring"""
-        upload_code = '''
-<?php
-function generateSecureFilename($extension) {
-    return bin2hex(random_bytes(16)) . $extension;
-}
+    def _validate_file_upload(self, file) -> Tuple[bool, str]:
+        """Validate file uploads with enhanced security checks"""
+        # Basic file checks
+        if not file or not file.filename:
+            return False, "No file provided"
+            
+        # Size validation
+        if file.content_length > self.config['MAX_UPLOAD_SIZE']:
+            return False, "File too large"
+            
+        # Extension validation
+        ext = Path(file.filename).suffix.lower()
+        if ext not in self.config['ALLOWED_EXTENSIONS']:
+            return False, "File type not allowed"
+            
+        # Content validation
+        try:
+            content = file.read(1024)  # Read first 1KB for validation
+            file.seek(0)  # Reset file pointer
+            
+            # Check for executable content
+            if b'\x7fELF' in content or b'MZ' in content:
+                return False, "Executable files not allowed"
+                
+            # Additional content validation based on extension
+            if ext == '.php':
+                php_patterns = [b'<?php', b'<?=', b'<script']
+                if any(pattern in content for pattern in php_patterns):
+                    self.monitor.record_event(SecurityEvent(
+                        'malicious_upload',
+                        'high',
+                        {'filename': file.filename, 'patterns_found': 'php_code'}
+                    ))
+                    return False, "PHP code not allowed"
+                    
+        except Exception as e:
+            self.logger.error(f"File validation error: {e}")
+            return False, "File validation failed"
+            
+        return True, ""
 
-function logUpload($filename, $ip) {
-    $log_file = '/var/log/siren/uploads.log';
-    $timestamp = date('Y-m-d H:i:s');
-    $log_entry = sprintf("[%s] Upload: %s from %s\\n", 
-        $timestamp, $filename, $ip);
-    file_put_contents($log_file, $log_entry, FILE_APPEND);
-}
-
-if(isset($_FILES['file'])) {
-    $file = $_FILES['file'];
-    $name = $file['name'];
-    $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
-    
-    // Enhanced validation
-    $allowed = array('txt', 'php', 'html', 'jpg', 'png');
-    $max_size = 10 * 1024 * 1024; // 10MB
-    
-    if(!in_array($ext, $allowed)) {
-        die('File type not allowed');
-    }
-    
-    if($file['size'] > $max_size) {
-        die('File too large');
-    }
-    
-    $newname = generateSecureFilename("." . $ext);
-    $path = "uploads/" . $newname;
-    
-    if(move_uploaded_file($file['tmp_name'], $path)) {
-        logUpload($newname, $_SERVER['REMOTE_ADDR']);
-        echo "File uploaded to: " . htmlspecialchars($path);
-    }
-}
-?>
-<form method="POST" enctype="multipart/form-data">
-    <input type="file" name="file">
-    <input type="submit" value="Upload">
-</form>
-'''
-        self._write_php_file("upload.php", upload_code)
-
-    def setup_monitoring(self):
-        """Setup comprehensive system monitoring"""
-        monitors = [
-            self._monitor_system_resources,
-            self._monitor_network_traffic,
-            self._monitor_file_changes,
-            self._monitor_authentication,
-            self._monitor_services,
-            self._monitor_vulnerabilities
-        ]
+    def handle_upload(self):
+        """Handle file uploads with security monitoring"""
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file provided'}), 400
+            
+        file = request.files['file']
+        valid, error = self._validate_file_upload(file)
         
-        for monitor in monitors:
-            thread = threading.Thread(target=monitor, daemon=True)
-            thread.start()
-
-    def _monitor_vulnerabilities(self):
-        """Monitor exploitation attempts"""
-        while True:
-            try:
-                self._check_upload_attempts()
-                self._check_sql_injection()
-                self._check_rce_attempts()
-                self._check_authentication_bypass()
-                time.sleep(self.config['MONITORING_INTERVAL'])
-            except Exception as e:
-                self.logger.error(f"Vulnerability monitoring error: {e}")
-
-    def create_backup(self):
-        """Create encrypted backup of critical data"""
-        backup_time = datetime.now()
-        backup_path = self.backup_dir / f"backup_{backup_time:%Y%m%d_%H%M%S}"
+        if not valid:
+            self.monitor.record_event(SecurityEvent(
+                'invalid_upload',
+                'medium',
+                {'error': error, 'filename': file.filename}
+            ))
+            return jsonify({'error': error}), 400
+            
+        # Generate secure filename
+        secure_filename = secrets.token_hex(16) + Path(file.filename).suffix
         
         try:
-            backup_path.mkdir(parents=True, exist_ok=True)
+            # Save file with proper permissions
+            upload_path = self.upload_dir / secure_filename
+            file.save(upload_path)
+            os.chmod(upload_path, 0o644)
             
-            # Backup configuration
-            config_backup = backup_path / "config.enc"
-            encrypted_config = self._encrypt_sensitive_data(
-                json.dumps(self.config)
-            )
-            with open(config_backup, 'wb') as f:
-                f.write(json.dumps(encrypted_config).encode())
+            # Calculate file hash
+            file_hash = hashlib.sha256()
+            with open(upload_path, 'rb') as f:
+                for chunk in iter(lambda: f.read(4096), b''):
+                    file_hash.update(chunk)
+                    
+            self.file_hashes[str(upload_path)] = file_hash.hexdigest()
             
-            # Backup logs
-            log_backup = backup_path / "logs.tar.gz"
-            subprocess.run([
-                "tar", "czf", str(log_backup),
-                "/var/log/siren"
-            ], check=True)
+            self.monitor.record_event(SecurityEvent(
+                'file_uploaded',
+                'info',
+                {
+                    'filename': secure_filename,
+                    'size': os.path.getsize(upload_path),
+                    'hash': self.file_hashes[str(upload_path)]
+                }
+            ))
             
-            self.last_backup = backup_time
-            self.logger.info(f"Backup created at {backup_path}")
+            return jsonify({
+                'success': True,
+                'filename': secure_filename,
+                'path': str(upload_path)
+            })
             
         except Exception as e:
-            self.logger.error(f"Backup failed: {e}")
+            self.logger.error(f"Upload error: {e}")
+            return jsonify({'error': 'Upload failed'}), 500
+
+    def run(self):
+        """Run the SIREN application with enhanced monitoring"""
+        try:
+            # Start monitoring threads
+            self.setup_monitoring()
+            
+            # Start the Flask application
+            self.app.run(
+                host=self.config['HOST'],
+                port=self.config['PORT'],
+                ssl_context=self._setup_ssl() if self.config['USE_SSL'] else None
+            )
+        except Exception as e:
+            self.logger.critical(f"Application startup failed: {e}")
+            sys.exit(1)
+        finally:
+            self._cleanup()
+
+if __name__ == "__main__":
+    siren = SIREN()
+    siren.run()
