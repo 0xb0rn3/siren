@@ -133,13 +133,6 @@ verify_network_isolation() {
     return "$errors"
 }
 
-    # Check for running services on common ports
-    local open_ports=$(netstat -tuln | grep LISTEN | awk '{print $4}' | cut -d: -f2)
-    log "INFO" "Currently open ports: ${open_ports:-none}"
-
-    return "$errors"
-}
-
 # Enhanced system requirements check with detailed reporting
 check_system_requirements() {
     log "INFO" "Performing comprehensive system check..."
