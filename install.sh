@@ -85,7 +85,6 @@ log() {
     chmod 640 "$log_file"
 }
 
-# Enhanced network verification with detailed checks
 verify_network_isolation() {
     log "INFO" "Performing comprehensive network isolation verification..."
     
@@ -97,7 +96,7 @@ verify_network_isolation() {
         log "INFO" "Available interfaces:"
         ip link show | grep -E '^[0-9]+:' | cut -d: -f2
         return 1
-    }
+    fi
 
     # Get current IP and verify it's in the sandbox network
     local current_ip=$(ip -4 addr show "$NETWORK_INTERFACE" | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
@@ -110,7 +109,7 @@ verify_network_isolation() {
             log "ERROR" "IP address $current_ip is not in sandbox network $SANDBOX_NET"
             ((errors++))
         fi
-    }
+    fi
 
     # Check for direct internet access
     local internet_check=0
@@ -126,6 +125,13 @@ verify_network_isolation() {
     if ! dig +short localhost &>/dev/null; then
         log "WARN" "DNS resolution may not be properly configured"
     fi
+
+    # Check for running services on common ports
+    local open_ports=$(netstat -tuln | grep LISTEN | awk '{print $4}' | cut -d: -f2)
+    log "INFO" "Currently open ports: ${open_ports:-none}"
+
+    return "$errors"
+}
 
     # Check for running services on common ports
     local open_ports=$(netstat -tuln | grep LISTEN | awk '{print $4}' | cut -d: -f2)
