@@ -380,7 +380,6 @@ monitor_file_integrity() {
     
     return "$changes_detected"
 }
-
 trigger_alert() {
     local message="$1"
     local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
