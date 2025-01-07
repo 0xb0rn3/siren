@@ -346,14 +346,36 @@ monitor_network_activity() {
 monitor_file_integrity() {
     # Monitor critical files for changes
     local changes_detected=0
+    
+    # Create a new hashes database
+    local hashes_db="$DATA_PATH/file_hashes.dat"
+    local new_hashes_db="$DATA_PATH/file_hashes.dat.new"
+    
     while IFS= read -r file; do
         if [ -f "$file" ]; then
             local current_hash=$(sha256sum "$file" | cut -d' ' -f1)
             local stored_hash=""
             
-           # Rotate file hashes database
-    if [ -f "$DATA_PATH/file_hashes.dat.new" ]; then
-        mv "$DATA_PATH/file_hashes.dat.new" "$DATA_PATH/file_hashes.dat"
+            # Check if we have a stored hash for this file
+            if [ -f "$hashes_db" ]; then
+                stored_hash=$(grep "^$file:" "$hashes_db" | cut -d: -f2)
+            fi
+            
+            # Compare hashes and detect changes
+            if [ -n "$stored_hash" ] && [ "$current_hash" != "$stored_hash" ]; then
+                log "WARN" "File integrity change detected: $file"
+                trigger_alert "File modification detected: $file"
+                ((changes_detected++))
+            fi
+            
+            # Store the current hash in the new database
+            echo "$file:$current_hash" >> "$new_hashes_db"
+        fi
+    done < "$CONFIG_PATH/monitored_files.txt"
+    
+    # Rotate file hashes database
+    if [ -f "$new_hashes_db" ]; then
+        mv "$new_hashes_db" "$hashes_db"
     fi
     
     return "$changes_detected"
